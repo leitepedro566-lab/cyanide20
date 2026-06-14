@@ -52,6 +52,8 @@
 #import <sys/utsname.h>
 #import <time.h>
 #import <unistd.h>
+#import <sys/stat.h>
+#import <dlfcn.h>
 
 @interface DSRespringOverlayView : UIView
 @property (nonatomic, strong) WKWebView *webView;
@@ -6334,6 +6336,8 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionAppSwitcherGrid,
     SectionIPADecryptor,
     SectionFastLockXLite,
+    SectionAppDowngrade,
+    SectionBlockUpdates,
     SectionCount,
 };
 
@@ -6395,6 +6399,1060 @@ static NSString *settings_pretty_date_for_iso(NSString *iso)
     NSDate *date = [in dateFromString:iso];
     return date ? [out stringFromDate:date] : iso;
 }
+
+// 👇================ 降级与屏蔽功能核心代码 ================👇
+static uint64_t downgrade_remote_alloc_str(const char *str) {
+    if (!str) return 0;
+    uint64_t len = strlen(str) + 1;
+    uint64_t buf = do_remote_call_stable(1000, "malloc", len, 0, 0, 0, 0, 0, 0, 0);
+    if (buf) {
+        remote_write(buf, str, len);
+    }
+    return buf;
+}
+
+static uint64_t remote_objc_getClass(const char *className) {
+    uint64_t strPtr = downgrade_remote_alloc_str(className);
+    if (!strPtr) return 0;
+    uint64_t cls = do_remote_call_stable(1000, "objc_getClass", strPtr, 0, 0, 0, 0, 0, 0, 0);
+    do_remote_call_stable(1000, "free", strPtr, 0, 0, 0, 0, 0, 0, 0);
+    return cls;
+}
+
+static uint64_t remote_sel_registerName(const char *selName) {
+    uint64_t strPtr = downgrade_remote_alloc_str(selName);
+    if (!strPtr) return 0;
+    uint64_t sel = do_remote_call_stable(1000, "sel_registerName", strPtr, 0, 0, 0, 0, 0, 0, 0);
+    do_remote_call_stable(1000, "free", strPtr, 0, 0, 0, 0, 0, 0, 0);
+    return sel;
+}
+
+static void downgrade_trigger_in_springboard(NSString *trackIdStr, NSString *versionIdStr) {
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        log_session_begin();
+        long long trackId = [trackIdStr longLongValue];
+        long long versionId = [versionIdStr longLongValue];
+        log_user("[DOWNGRADE] Requesting downgrade (Track: %lld, Version: %lld)...\n", trackId, versionId);
+        if (!settings_ensure_kexploit()) {
+            log_user("[DOWNGRADE] Failed: kernel primitives not acquired.\n");
+            log_session_end();
+            return;
+        }
+        @synchronized (settings_rc_lock()) {
+            if (!settings_ensure_springboard_remote_call_locked()) {
+                log_user("[DOWNGRADE] Failed to attach to SpringBoard.\n");
+                log_session_end();
+                return;
+            }
+            int sbx = escape_sbx_demo2_in_session();
+            if (sbx == 0) {
+                log_user("[DOWNGRADE] Sandbox extension consumed by SpringBoard.\n");
+            } else {
+                log_user("[WARN] Sandbox escape failed or already active (%d).\n", sbx);
+            }
+            log_user("[DOWNGRADE] Loading StoreKitUI framework into SpringBoard...\n");
+            uint64_t frameworkPathPtr = downgrade_remote_alloc_str("/System/Library/PrivateFrameworks/StoreKitUI.framework/StoreKitUI");
+            if (!frameworkPathPtr) {
+                log_user("[DOWNGRADE] ERROR: Failed to allocate memory in SpringBoard.\n");
+                log_session_end();
+                return;
+            }
+            uint64_t handle = do_remote_call_stable(1000, "dlopen", frameworkPathPtr, 9, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", frameworkPathPtr, 0, 0, 0, 0, 0, 0, 0);
+            if (!handle) {
+                log_user("[DOWNGRADE] ERROR: SpringBoard failed to dlopen StoreKitUI.\n");
+                log_session_end();
+                return;
+            }
+            log_user("[DOWNGRADE] Constructing SKUI objects...\n");
+            NSString *adamIdStr = [NSString stringWithFormat:@"%lld", trackId];
+            NSString *buyParamsStr = [NSString stringWithFormat:@"productType=C&price=0&salableAdamId=%lld&pricingParameters=pricingParameter&appExtVrsId=%lld&clientBuyId=1&installed=0&trolled=1", trackId, versionId];
+            uint64_t adamIdCStrPtr = downgrade_remote_alloc_str(adamIdStr.UTF8String);
+            uint64_t paramsCStrPtr = downgrade_remote_alloc_str(buyParamsStr.UTF8String);
+            uint64_t kindCStrPtr = downgrade_remote_alloc_str("iosSoftware");
+            uint64_t buyParamsKeyCStrPtr = downgrade_remote_alloc_str("buyParams");
+            uint64_t itemOfferKeyCStrPtr = downgrade_remote_alloc_str("_itemOffer");
+            uint64_t kindKeyCStrPtr = downgrade_remote_alloc_str("_itemKindString");
+            uint64_t verKeyCStrPtr = downgrade_remote_alloc_str("_versionIdentifier");
+            uint64_t nsstringClass = remote_objc_getClass("NSString");
+            uint64_t stringWithUTF8StringSel = remote_sel_registerName("stringWithUTF8String:");
+            uint64_t adamIdNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, adamIdCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t paramsNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, paramsCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t kindNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, kindCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t buyParamsKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, buyParamsKeyCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t itemOfferKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, itemOfferKeyCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t kindKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, kindKeyCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t verKeyNS = do_remote_call_stable(1000, "objc_msgSend", nsstringClass, stringWithUTF8StringSel, verKeyCStrPtr, 0, 0, 0, 0, 0);
+            uint64_t nsnumberClass = remote_objc_getClass("NSNumber");
+            uint64_t numberWithLongLongSel = remote_sel_registerName("numberWithLongLong:");
+            uint64_t versionNSNum = do_remote_call_stable(1000, "objc_msgSend", nsnumberClass, numberWithLongLongSel, versionId, 0, 0, 0, 0, 0);
+            uint64_t nsdictClass = remote_objc_getClass("NSDictionary");
+            uint64_t dictWithObjectForKeySel = remote_sel_registerName("dictionaryWithObject:forKey:");
+            uint64_t offerDict = do_remote_call_stable(1000, "objc_msgSend", nsdictClass, dictWithObjectForKeySel, paramsNS, buyParamsKeyNS, 0, 0, 0, 0);
+            uint64_t itemDict = do_remote_call_stable(1000, "objc_msgSend", nsdictClass, dictWithObjectForKeySel, adamIdNS, itemOfferKeyNS, 0, 0, 0, 0);
+            uint64_t allocSel = remote_sel_registerName("alloc");
+            uint64_t initDictSel = remote_sel_registerName("initWithLookupDictionary:");
+            uint64_t offerClass = remote_objc_getClass("SKUIItemOffer");
+            uint64_t offerAlloc = do_remote_call_stable(1000, "objc_msgSend", offerClass, allocSel, 0, 0, 0, 0, 0, 0);
+            uint64_t offerObj = do_remote_call_stable(1000, "objc_msgSend", offerAlloc, initDictSel, offerDict, 0, 0, 0, 0, 0);
+            uint64_t itemClass = remote_objc_getClass("SKUIItem");
+            uint64_t itemAlloc = do_remote_call_stable(1000, "objc_msgSend", itemClass, allocSel, 0, 0, 0, 0, 0, 0);
+            uint64_t itemObj = do_remote_call_stable(1000, "objc_msgSend", itemAlloc, initDictSel, itemDict, 0, 0, 0, 0, 0);
+            if (!offerObj || !itemObj) {
+                log_user("[DOWNGRADE] ERROR: Failed to instantiate SKUI items.\n");
+                log_session_end();
+                return;
+            }
+            uint64_t setValueForKeySel = remote_sel_registerName("setValue:forKey:");
+            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, offerObj, itemOfferKeyNS, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, kindNS, kindKeyNS, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "objc_msgSend", itemObj, setValueForKeySel, versionNSNum, verKeyNS, 0, 0, 0, 0);
+            uint64_t contextClass = remote_objc_getClass("SKUIClientContext");
+            uint64_t defContextSel = remote_sel_registerName("defaultContext");
+            uint64_t contextObj = do_remote_call_stable(1000, "objc_msgSend", contextClass, defContextSel, 0, 0, 0, 0, 0, 0);
+            uint64_t centerClass = remote_objc_getClass("SKUIItemStateCenter");
+            uint64_t defCenterSel = remote_sel_registerName("defaultCenter");
+            uint64_t centerObj = do_remote_call_stable(1000, "objc_msgSend", centerClass, defCenterSel, 0, 0, 0, 0, 0, 0);
+            uint64_t nsarrayClass = remote_objc_getClass("NSArray");
+            uint64_t arrayWithObjectSel = remote_sel_registerName("arrayWithObject:");
+            uint64_t itemsArray = do_remote_call_stable(1000, "objc_msgSend", nsarrayClass, arrayWithObjectSel, itemObj, 0, 0, 0, 0, 0);
+            uint64_t newPurchasesSel = remote_sel_registerName("_newPurchasesWithItems:");
+            uint64_t purchasesObj = do_remote_call_stable(1000, "objc_msgSend", centerObj, newPurchasesSel, itemsArray, 0, 0, 0, 0, 0);
+            log_user("[DOWNGRADE] Sending purchase request to App Store daemon...\n");
+            uint64_t performPurchasesSel = remote_sel_registerName("_performPurchases:hasBundlePurchase:withClientContext:completionBlock:");
+            do_remote_call_stable(1000, "objc_msgSend", centerObj, performPurchasesSel, purchasesObj, 0, contextObj, 0, 0, 0);
+            do_remote_call_stable(1000, "free", adamIdCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", paramsCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", kindCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", buyParamsKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", itemOfferKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", kindKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            do_remote_call_stable(1000, "free", verKeyCStrPtr, 0, 0, 0, 0, 0, 0, 0);
+            log_user("[OK] Payload executed via RemoteCall! Please check your Home Screen for the downloading App.\n");
+        }
+        log_session_end();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
+        });
+    });
+}
+
+@interface AppListViewController : UITableViewController <UISearchResultsUpdating>
+@property (nonatomic, strong) NSArray<NSDictionary *> *apps;
+@property (nonatomic, strong) NSArray<NSDictionary *> *filteredApps;
+@property (nonatomic, strong) NSArray<NSDictionary *> *appStoreResults; 
+@property (nonatomic, strong) UISearchController *searchController;
+@property (nonatomic, strong) NSURLSessionDataTask *currentSearchTask; 
+@property (nonatomic, strong) NSCache<NSString *, UIImage *> *imageCache; 
+@end
+
+static NSArray<NSDictionary *> *g_sharedLocalAppsCache = nil;
+
+@implementation AppListViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Select App to Downgrade";
+    self.tableView.rowHeight = 60;
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh target:self action:@selector(forceRefreshApps)];
+    
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.searchResultsUpdater = self;
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"Search App or Paste App Store Link";
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
+    
+    self.filteredApps = @[];
+    self.appStoreResults = @[];
+    self.imageCache = [[NSCache alloc] init];
+    self.imageCache.countLimit = 100;
+    
+    [self loadApps];
+}
+
+- (void)forceRefreshApps {
+    g_sharedLocalAppsCache = nil;
+    [self loadApps];
+}
+
+- (BOOL)isFiltering {
+    return self.searchController.isActive && self.searchController.searchBar.text.length > 0;
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    NSString *searchText = searchController.searchBar.text;
+    
+    [self.currentSearchTask cancel];
+    self.currentSearchTask = nil;
+
+    if (searchText.length == 0) {
+        self.filteredApps = @[];
+        self.appStoreResults = @[];
+        [self.tableView reloadData];
+        return;
+    }
+
+    NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(NSDictionary *appInfo, NSDictionary *bindings) {
+        NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
+        return [name localizedCaseInsensitiveContainsString:searchText];
+    }];
+    self.filteredApps = [self.apps filteredArrayUsingPredicate:predicate];
+    [self.tableView reloadData];
+
+    NSString *appId = nil;
+    if ([searchText localizedCaseInsensitiveContainsString:@"apps.apple.com"] && [searchText containsString:@"/id"]) {
+        NSRange idRange = [searchText rangeOfString:@"/id"];
+        if (idRange.location != NSNotFound) {
+            NSString *substring = [searchText substringFromIndex:idRange.location + 3];
+            NSMutableString *digits = [NSMutableString string];
+            for (NSUInteger i = 0; i < substring.length; i++) {
+                unichar c = [substring characterAtIndex:i];
+                if (c >= '0' && c <= '9') {
+                    [digits appendFormat:@"%c", c];
+                } else {
+                    break;
+                }
+            }
+            if (digits.length > 0) appId = digits;
+        }
+    }
+
+    NSString *countryCode = [[NSLocale currentLocale] objectForKey:NSLocaleCountryCode] ?: @"us";
+    NSString *urlString;
+    if (appId) {
+        urlString = [NSString stringWithFormat:@"https://itunes.apple.com/lookup?id=%@&country=%@", appId, countryCode];
+    } else {
+        NSString *encodedSearch = [searchText stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+        urlString = [NSString stringWithFormat:@"https://itunes.apple.com/search?term=%@&entity=software&limit=25&country=%@", encodedSearch, countryCode];
+    }
+    
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    req.timeoutInterval = 6.0;
+    
+    __weak typeof(self) weakSelf = self;
+    self.currentSearchTask = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) return; 
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray *results = json[@"results"];
+        if ([results isKindOfClass:[NSArray class]]) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                strongSelf.appStoreResults = results;
+                if ([strongSelf isFiltering]) {
+                    [strongSelf.tableView reloadData]; 
+                }
+            });
+        }
+    }];
+    [self.currentSearchTask resume];
+}
+
+- (void)loadApps {
+    if (g_sharedLocalAppsCache.count > 0) {
+        self.apps = g_sharedLocalAppsCache;
+        [self.tableView reloadData];
+        return;
+    }
+
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    [spinner startAnimating];
+    self.tableView.backgroundView = spinner;
+    self.apps = @[];
+    [self.tableView reloadData];
+    self.navigationItem.rightBarButtonItem.enabled = NO;
+    
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        if (!g_springboard_sandbox_escaped) {
+            escape_sbx_demo2();
+        }
+        
+        NSString *appsPath = @"/var/containers/Bundle/Application";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *appDirs = [fm contentsOfDirectoryAtPath:appsPath error:nil];
+        NSMutableArray *userApps = [NSMutableArray array];
+        
+        for (NSString *uuidDir in appDirs) {
+            NSString *appGroupPath = [appsPath stringByAppendingPathComponent:uuidDir];
+            NSArray *subContents = [fm contentsOfDirectoryAtPath:appGroupPath error:nil];
+            for (NSString *sub in subContents) {
+                if ([sub hasSuffix:@".app"]) {
+                    NSString *appBundlePath = [appGroupPath stringByAppendingPathComponent:sub];
+                    NSString *infoPlistPath = [appBundlePath stringByAppendingPathComponent:@"Info.plist"];
+                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                    
+                    if (info && info[@"CFBundleIdentifier"]) {
+                        NSString *bundleId = info[@"CFBundleIdentifier"];
+                        if ([bundleId hasPrefix:@"com.apple"]) continue;
+                        NSMutableDictionary *mutableInfo = [info mutableCopy];
+                        mutableInfo[@"AppBundlePath"] = appBundlePath;
+                        mutableInfo[@"AppVersion"] = info[@"CFBundleShortVersionString"] ?: @"1.0";
+                        [userApps addObject:mutableInfo];
+                    }
+                }
+            }
+        }
+        
+        [userApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
+            NSString *name1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
+            NSString *name2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
+            return [name1 localizedCaseInsensitiveCompare:name2];
+        }];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_sharedLocalAppsCache = [userApps copy]; 
+            self.apps = g_sharedLocalAppsCache;
+            self.tableView.backgroundView = nil;
+            self.navigationItem.rightBarButtonItem.enabled = YES;
+            
+            [UIView transitionWithView:self.tableView duration:0.25 options:UIViewAnimationOptionTransitionCrossDissolve animations:^{
+                [self.tableView reloadData];
+            } completion:nil];
+        });
+    });
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return [self isFiltering] ? 2 : 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (![self isFiltering]) return self.apps.count;
+    if (section == 0) return self.filteredApps.count;
+    if (section == 1) return self.appStoreResults.count;
+    return 0;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (![self isFiltering]) return nil;
+    if (section == 0 && self.filteredApps.count > 0) return @"Local Installed Apps";
+    if (section == 1 && self.appStoreResults.count > 0) return @"App Store Search (Install directly)";
+    return nil;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AppCell"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"AppCell"];
+    
+    if (![self isFiltering] || indexPath.section == 0) {
+        NSDictionary *appInfo = [self isFiltering] ? self.filteredApps[indexPath.row] : self.apps[indexPath.row];
+        NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
+        cell.textLabel.text = name;
+        NSString *ver = appInfo[@"AppVersion"];
+        cell.detailTextLabel.text = ver.length > 0 ? [NSString stringWithFormat:@"%@ (v%@)", appInfo[@"CFBundleIdentifier"], ver] : appInfo[@"CFBundleIdentifier"];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+        
+        NSString *bundlePath = appInfo[@"AppBundlePath"];
+        UIImage *iconImage = nil;
+        if (bundlePath) {
+            NSBundle *appBundle = [NSBundle bundleWithPath:bundlePath];
+            NSString *iconName = nil;
+            NSDictionary *icons = appInfo[@"CFBundleIcons"];
+            if ([icons isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *primaryIcon = icons[@"CFBundlePrimaryIcon"];
+                if ([primaryIcon isKindOfClass:[NSDictionary class]]) {
+                    NSArray *files = primaryIcon[@"CFBundleIconFiles"];
+                    if ([files isKindOfClass:[NSArray class]]) {
+                        iconName = files.lastObject;
+                    }
+                }
+            }
+            if (!iconName) {
+                NSArray *files = appInfo[@"CFBundleIconFiles"];
+                if ([files isKindOfClass:[NSArray class]]) {
+                    iconName = files.lastObject;
+                }
+            }
+            if (iconName) {
+                UIImage *rawIcon = [UIImage imageNamed:iconName inBundle:appBundle compatibleWithTraitCollection:nil];
+                if (rawIcon) {
+                    CGSize itemSize = CGSizeMake(40, 40);
+                    UIGraphicsBeginImageContextWithOptions(itemSize, NO, [UIScreen mainScreen].scale);
+                    UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, itemSize.width, itemSize.height) cornerRadius:8.0];
+                    [path addClip];
+                    [rawIcon drawInRect:CGRectMake(0, 0, itemSize.width, itemSize.height)];
+                    iconImage = UIGraphicsGetImageFromCurrentImageContext();
+                    UIGraphicsEndImageContext();
+                }
+            }
+        }
+        
+        if (iconImage) {
+            cell.imageView.image = iconImage;
+        } else {
+            UIImage *fallback = [UIImage systemImageNamed:@"app.dashed"];
+            cell.imageView.image = [fallback imageWithTintColor:[UIColor systemGrayColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
+        }
+    } 
+    else if ([self isFiltering] && indexPath.section == 1) {
+        NSDictionary *storeApp = self.appStoreResults[indexPath.row];
+        cell.textLabel.text = storeApp[@"trackName"] ?: @"Unknown App";
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ ☁️", storeApp[@"bundleId"]];
+        cell.detailTextLabel.textColor = [UIColor systemBlueColor];
+        
+        NSString *artworkUrl = storeApp[@"artworkUrl512"] ?: storeApp[@"artworkUrl100"] ?: storeApp[@"artworkUrl60"];
+        UIImage *cachedImage = [self.imageCache objectForKey:artworkUrl ?: @""];
+        
+        if (cachedImage) {
+            cell.imageView.image = cachedImage;
+        } else {
+            UIImage *fallback = [UIImage systemImageNamed:@"icloud.and.arrow.down"];
+            cell.imageView.image = [fallback imageWithTintColor:[UIColor systemBlueColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
+            
+            if (artworkUrl.length > 0) {
+                NSURLSessionDataTask *imgTask = [[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:artworkUrl] completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+                    if (data && !error) {
+                        UIImage *img = [UIImage imageWithData:data];
+                        if (img) {
+                            UIGraphicsBeginImageContextWithOptions(CGSizeMake(40, 40), NO, [UIScreen mainScreen].scale);
+                            UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, 40, 40) cornerRadius:8.0];
+                            [path addClip];
+                            [img drawInRect:CGRectMake(0, 0, 40, 40)];
+                            UIImage *roundedImg = UIGraphicsGetImageFromCurrentImageContext();
+                            UIGraphicsEndImageContext();
+                            
+                            if (roundedImg) {
+                                [self.imageCache setObject:roundedImg forKey:artworkUrl];
+                                dispatch_async(dispatch_get_main_queue(), ^{
+                                    UITableViewCell *visibleCell = [tableView cellForRowAtIndexPath:indexPath];
+                                    if (visibleCell) {
+                                        visibleCell.imageView.image = roundedImg;
+                                        [visibleCell setNeedsLayout];
+                                    }
+                                });
+                            }
+                        }
+                    }
+                }];
+                [imgTask resume];
+            }
+        }
+    }
+    
+    return cell;
+}
+
+- (NSArray<NSString *> *)downgrade_supportedAppStoreCountryCodes {
+    return @[@"cn", @"us", @"ae", @"ag", @"ai", @"al", @"am", @"ao", @"ar", @"at", @"au", @"az", @"bb", @"be", @"bf", @"bg", @"bh", @"bj", @"bm", @"bn", @"bo", @"br", @"bs", @"bt", @"bw", @"by", @"bz", @"ca", @"cg", @"ch", @"ci", @"cl", @"cm", @"co", @"cr", @"cv", @"cy", @"cz", @"de", @"dk", @"dm", @"do", @"dz", @"ec", @"ee", @"eg", @"es", @"fi", @"fj", @"fm", @"fr", @"gb", @"gd", @"gh", @"gm", @"gr", @"gt", @"gw", @"gy", @"hk", @"hn", @"hr", @"hu", @"id", @"ie", @"il", @"in", @"is", @"it", @"jm", @"jo", @"jp", @"ke", @"kg", @"kh", @"kn", @"kr", @"kw", @"ky", @"kz", @"la", @"lb", @"lc", @"lk", @"lr", @"lt", @"lu", @"lv", @"md", @"mg", @"mk", @"ml", @"mn", @"mo", @"mr", @"ms", @"mt", @"mu", @"mw", @"mx", @"my", @"na", @"ne", @"ng", @"ni", @"nl", @"no", @"np", @"nz", @"om", @"pa", @"pe", @"pg", @"ph", @"pk", @"pl", @"pt", @"pw", @"py", @"qa", @"ro", @"ru", @"rw", @"sa", @"sb", @"sc", @"se", @"sg", @"si", @"sk", @"sl", @"sn", @"sr", @"st", @"sv", @"sz", @"tc", @"td", @"th", @"tj", @"tm", @"tn", @"tr", @"tt", @"tw", @"tz", @"ua", @"ug", @"uy", @"uz", @"vc", @"ve", @"vg", @"vn", @"ye", @"za", @"zm", @"zw"];
+}
+
+- (void)downgrade_fetchTrackIDWithCountryCodes:(NSArray<NSString *> *)countryCodes index:(NSInteger)index bundleId:(NSString *)bundleId completion:(void(^)(long long trackId, NSError *err))completion {
+    if (index >= countryCodes.count) {
+        if (completion) {
+            completion(0, [NSError errorWithDomain:@"Downgrade" code:404 userInfo:@{NSLocalizedDescriptionKey: @"App not found in supported App Store regions."}]);
+        }
+        return;
+    }
+    NSString *countryCode = countryCodes[index];
+    NSString *urlString = [NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&limit=1&media=software&country=%@", bundleId, countryCode];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    req.timeoutInterval = 10.0;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        if (error || !data) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:index + 1 bundleId:bundleId completion:completion];
+            });
+            return;
+        }
+        NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        NSArray *results = json[@"results"];
+        if ([results isKindOfClass:[NSArray class]] && results.count > 0) {
+            long long trackId = [results.firstObject[@"trackId"] longLongValue];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (completion) completion(trackId, nil);
+            });
+        } else {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:index + 1 bundleId:bundleId completion:completion];
+            });
+        }
+    }];
+    [task resume];
+}
+
+- (void)downgrade_fetchTrackIDForBundleID:(NSString *)bundleId completion:(void(^)(long long trackId, NSError *err))completion {
+    NSArray<NSString *> *countryCodes = [self downgrade_supportedAppStoreCountryCodes];
+    [self downgrade_fetchTrackIDWithCountryCodes:countryCodes index:0 bundleId:bundleId completion:completion];
+}
+
+- (void)downgrade_fetchVersionsForTrackID:(long long)trackId completion:(void(^)(NSArray *versions, NSError *err))completion {
+    NSString *urlString = [NSString stringWithFormat:@"https://apis.bilin.eu.org/history/%lld", trackId];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+    req.timeoutInterval = 10.0;
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (error || !data) { if(completion) completion(nil, error); return; }
+            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            NSArray *versions = json[@"data"];
+            if ([versions isKindOfClass:[NSArray class]] && versions.count > 0) {
+                if (completion) completion(versions, nil);
+            } else {
+                if (completion) completion(nil, [NSError errorWithDomain:@"Downgrade" code:404 userInfo:@{NSLocalizedDescriptionKey: @"No historical versions found."}]);
+            }
+        });
+    }];
+    [task resume];
+}
+
+- (void)downgrade_presentVersionSelection:(NSArray *)versions trackID:(long long)trackId {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Select Version" message:@"Choose a version to downgrade to" preferredStyle:UIAlertControllerStyleActionSheet];
+    NSArray *sortedVersions = [versions sortedArrayUsingDescriptors:@[[NSSortDescriptor sortDescriptorWithKey:@"release_date" ascending:NO]]];
+    for (NSDictionary *ver in sortedVersions) {
+        NSString *bVer = ver[@"bundle_version"] ?: @"N/A";
+        NSString *extId = [ver[@"external_identifier"] stringValue] ?: @"";
+        NSString *title = extId.length > 0 ? [NSString stringWithFormat:@"%@ (%@)", bVer, extId] : bVer;
+        [alert addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+            NSString *versionIdStr = [ver[@"external_identifier"] stringValue];
+            NSString *trackIdStr = [NSString stringWithFormat:@"%lld", trackId];
+            InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
+            UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+            logNav.modalPresentationStyle = UIModalPresentationAutomatic;
+            [self presentViewController:logNav animated:YES completion:^{
+                downgrade_trigger_in_springboard(trackIdStr, versionIdStr);
+            }];
+        }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad && alert.popoverPresentationController) {
+        alert.popoverPresentationController.sourceView = self.view;
+        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 1.0, 1.0);
+        alert.popoverPresentationController.permittedArrowDirections = 0;
+    }
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)fetchDowngradeDataForApp:(NSDictionary *)appInfo {
+    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+    NSString *appName = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: bundleId;
+    
+    UIAlertController *loadingAlert = [UIAlertController alertControllerWithTitle:@"Fetching Data" 
+                                                                          message:[NSString stringWithFormat:@"Looking up history for %@...", appName] 
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+    
+    [self presentViewController:loadingAlert animated:YES completion:^{
+        [self executeFetchWithBundleId:bundleId appInfo:appInfo loadingAlert:loadingAlert];
+    }];
+}
+
+- (void)executeFetchWithBundleId:(NSString *)bundleId appInfo:(NSDictionary *)appInfo loadingAlert:(UIAlertController *)loadingAlert {
+    __block BOOL isFinished = NO;
+    
+    NSNumber *preFetchedID = appInfo[@"PreFetchedTrackID"];
+    if (preFetchedID != nil) {
+        long long trackId = preFetchedID.longLongValue;
+        [self downgrade_fetchVersionsForTrackID:trackId completion:^(NSArray *versions, NSError *verErr) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                    if (verErr || versions.count == 0) {
+                        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:verErr.localizedDescription ?: @"Failed to get versions" preferredStyle:UIAlertControllerStyleAlert];
+                        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                        [self presentViewController:errAlert animated:YES completion:nil];
+                        return;
+                    }
+                    [self downgrade_presentVersionSelection:versions trackID:trackId];
+                }];
+            });
+        }];
+        return; 
+    }
+    
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (isFinished) return;
+        isFinished = YES;
+        [loadingAlert dismissViewControllerAnimated:YES completion:^{
+            UIAlertController *timeoutAlert = [UIAlertController alertControllerWithTitle:@"Timeout" 
+                                                                                  message:@"Failed to fetch data within 15 seconds." 
+                                                                           preferredStyle:UIAlertControllerStyleAlert];
+            [timeoutAlert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [timeoutAlert addAction:[UIAlertAction actionWithTitle:@"Retry" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+                [self fetchDowngradeDataForApp:appInfo];
+            }]];
+            [self presentViewController:timeoutAlert animated:YES completion:nil];
+        }];
+    });
+
+    [self downgrade_fetchTrackIDForBundleID:bundleId completion:^(long long trackId, NSError *err) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (isFinished) return;
+            if (err || trackId == 0) {
+                isFinished = YES;
+                [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                    UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:err.localizedDescription ?: @"Failed to get Track ID" preferredStyle:UIAlertControllerStyleAlert];
+                    [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                    [self presentViewController:errAlert animated:YES completion:nil];
+                }];
+                return;
+            }
+            [self downgrade_fetchVersionsForTrackID:trackId completion:^(NSArray *versions, NSError *verErr) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (isFinished) return;
+                    isFinished = YES;
+                    [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                        if (verErr || versions.count == 0) {
+                            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Error" message:verErr.localizedDescription ?: @"Failed to get versions" preferredStyle:UIAlertControllerStyleAlert];
+                            [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                            [self presentViewController:errAlert animated:YES completion:nil];
+                            return;
+                        }
+                        [self downgrade_presentVersionSelection:versions trackID:trackId];
+                    }];
+                });
+            }];
+        });
+    }];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    
+    NSDictionary *appInfo;
+    
+    if ([self isFiltering] && indexPath.section == 1) {
+        NSDictionary *storeApp = self.appStoreResults[indexPath.row];
+        NSMutableDictionary *mockInfo = [NSMutableDictionary dictionary];
+        mockInfo[@"CFBundleIdentifier"] = storeApp[@"bundleId"];
+        mockInfo[@"CFBundleDisplayName"] = storeApp[@"trackName"];
+        mockInfo[@"PreFetchedTrackID"] = storeApp[@"trackId"];
+        appInfo = [mockInfo copy];
+    } else {
+        if ([self isFiltering]) {
+            appInfo = self.filteredApps[indexPath.row];
+        } else {
+            appInfo = self.apps[indexPath.row];
+        }
+    }
+    
+    [self presentActionSheetForApp:appInfo tableView:tableView indexPath:indexPath];
+}
+
+- (void)presentActionSheetForApp:(NSDictionary *)appInfo tableView:(UITableView *)tableView indexPath:(NSIndexPath *)indexPath {
+    UIAlertController *actionSheet = [UIAlertController alertControllerWithTitle:@"Downgrade/Install Method" 
+                                                                         message:@"Choose how to get the version ID" 
+                                                                  preferredStyle:UIAlertControllerStyleActionSheet];
+    
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"Fetch from Server" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self fetchDowngradeDataForApp:appInfo];
+    }]];
+    
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"Custom Version ID" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+        [self promptForCustomVersionForApp:appInfo];
+    }]];
+    
+    [actionSheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    
+    if ([[UIDevice currentDevice] userInterfaceIdiom] == UIUserInterfaceIdiomPad && actionSheet.popoverPresentationController) {
+        UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+        if (cell) {
+            actionSheet.popoverPresentationController.sourceView = cell;
+            actionSheet.popoverPresentationController.sourceRect = cell.bounds;
+        } else {
+            actionSheet.popoverPresentationController.sourceView = self.view;
+            actionSheet.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, self.view.bounds.size.height / 2.0, 1.0, 1.0);
+        }
+    }
+    
+    [self presentViewController:actionSheet animated:YES completion:nil];
+}
+
+- (void)promptForCustomVersionForApp:(NSDictionary *)appInfo {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Custom Version ID" 
+                                                                   message:@"Enter the numeric AppExtVrsId for the version:\ne.g., 843219482" 
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    
+    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+        textField.placeholder = @"Version ID";
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+    }];
+    
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Downgrade" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+        NSString *customVersion = alert.textFields.firstObject.text;
+        if (customVersion.length > 0) {
+            [self executeCustomDowngradeWithAppInfo:appInfo versionId:customVersion];
+        }
+    }]];
+    
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)executeCustomDowngradeWithAppInfo:(NSDictionary *)appInfo versionId:(NSString *)versionId {
+    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+    NSString *appName = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: bundleId;
+    
+    UIAlertController *loadingAlert = [UIAlertController alertControllerWithTitle:@"Preparing" 
+                                                                          message:[NSString stringWithFormat:@"Fetching Track ID for %@...", appName] 
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+    
+    [self presentViewController:loadingAlert animated:YES completion:^{
+        NSNumber *preFetchedID = appInfo[@"PreFetchedTrackID"];
+        if (preFetchedID != nil) {
+            NSString *trackIdStr = [NSString stringWithFormat:@"%lld", preFetchedID.longLongValue];
+            [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
+                UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+                logNav.modalPresentationStyle = UIModalPresentationAutomatic;
+                [self presentViewController:logNav animated:YES completion:^{
+                    downgrade_trigger_in_springboard(trackIdStr, versionId);
+                }];
+            }];
+            return;
+        }
+        
+        [self downgrade_fetchTrackIDForBundleID:bundleId completion:^(long long trackId, NSError *err) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                    if (err || trackId == 0) {
+                        UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Failed" 
+                                                                                          message:err.localizedDescription ?: @"Could not fetch the Track ID for this app." 
+                                                                                   preferredStyle:UIAlertControllerStyleAlert];
+                        [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                        [self presentViewController:errAlert animated:YES completion:nil];
+                        return;
+                    }
+                    
+                    NSString *trackIdStr = [NSString stringWithFormat:@"%lld", trackId];
+                    InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
+                    UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+                    logNav.modalPresentationStyle = UIModalPresentationAutomatic;
+                    
+                    [self presentViewController:logNav animated:YES completion:^{
+                        downgrade_trigger_in_springboard(trackIdStr, versionId);
+                    }];
+                }];
+            });
+        }];
+    }];
+}
+
+@end
+
+@interface BlockUpdatesViewController : UITableViewController <UISearchResultsUpdating>
+@property (nonatomic, strong) NSArray<NSDictionary *> *apps;
+@property (nonatomic, strong) NSArray<NSDictionary *> *filteredApps;
+@property (nonatomic, strong) UISearchController *searchController;
+@property (nonatomic, strong) NSMutableSet<NSString *> *waitingApps; 
+@end
+
+@implementation BlockUpdatesViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"Block App Updates";
+    self.tableView.rowHeight = 60;
+    self.waitingApps = [NSMutableSet set];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Done" style:UIBarButtonItemStyleDone target:self action:@selector(commitUpdates)];
+    
+    UIRefreshControl *refreshControl = [[UIRefreshControl alloc] init];
+    [refreshControl addTarget:self action:@selector(handleRefresh:) forControlEvents:UIControlEventValueChanged];
+    self.tableView.refreshControl = refreshControl;
+    
+    self.searchController = [[UISearchController alloc] initWithSearchResultsController:nil];
+    self.searchController.searchResultsUpdater = self;
+    self.searchController.obscuresBackgroundDuringPresentation = NO;
+    self.searchController.searchBar.placeholder = @"Search App";
+    self.navigationItem.searchController = self.searchController;
+    self.navigationItem.hidesSearchBarWhenScrolling = NO;
+    self.definesPresentationContext = YES;
+    self.filteredApps = @[];
+    [self loadApps];
+}
+
+- (void)handleRefresh:(UIRefreshControl *)refreshControl {
+    g_sharedLocalAppsCache = nil; 
+    [self loadApps];
+}
+
+- (BOOL)isFiltering {
+    return self.searchController.isActive && self.searchController.searchBar.text.length > 0;
+}
+
+- (void)updateSearchResultsForSearchController:(UISearchController *)searchController {
+    NSString *searchText = searchController.searchBar.text;
+    if (searchText.length == 0) {
+        self.filteredApps = @[];
+    } else {
+        NSPredicate *predicate = [NSPredicate predicateWithBlock:^BOOL(NSDictionary *appInfo, NSDictionary *bindings) {
+            NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
+            return [name localizedCaseInsensitiveContainsString:searchText];
+        }];
+        self.filteredApps = [self.apps filteredArrayUsingPredicate:predicate];
+    }
+    [self.tableView reloadData];
+}
+
+- (void)loadApps {
+    if (g_sharedLocalAppsCache.count > 0) {
+        self.apps = g_sharedLocalAppsCache;
+        [self.tableView reloadData];
+        if (self.tableView.refreshControl.isRefreshing) {
+            [self.tableView.refreshControl endRefreshing];
+        }
+        return;
+    }
+
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleLarge];
+    [spinner startAnimating];
+    if (!self.tableView.refreshControl.isRefreshing) {
+        self.tableView.backgroundView = spinner;
+    }
+    self.apps = @[];
+    [self.tableView reloadData];
+    
+    dispatch_async(dispatch_get_global_queue(0, 0), ^{
+        if (!g_springboard_sandbox_escaped) {
+            escape_sbx_demo2();
+        }
+        
+        NSString *appsPath = @"/var/containers/Bundle/Application";
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSArray *appDirs = [fm contentsOfDirectoryAtPath:appsPath error:nil];
+        NSMutableArray *userApps = [NSMutableArray array];
+        
+        for (NSString *uuidDir in appDirs) {
+            NSString *appGroupPath = [appsPath stringByAppendingPathComponent:uuidDir];
+            NSArray *subContents = [fm contentsOfDirectoryAtPath:appGroupPath error:nil];
+            for (NSString *sub in subContents) {
+                if ([sub hasSuffix:@".app"]) {
+                    NSString *appBundlePath = [appGroupPath stringByAppendingPathComponent:sub];
+                    NSString *infoPlistPath = [appBundlePath stringByAppendingPathComponent:@"Info.plist"];
+                    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                    
+                    if (info && info[@"CFBundleIdentifier"]) {
+                        NSString *bundleId = info[@"CFBundleIdentifier"];
+                        if ([bundleId hasPrefix:@"com.apple"]) continue;
+                        NSMutableDictionary *mutableInfo = [info mutableCopy];
+                        mutableInfo[@"AppBundlePath"] = appBundlePath;
+                        mutableInfo[@"AppVersion"] = info[@"CFBundleShortVersionString"] ?: @"1.0";
+                        [userApps addObject:mutableInfo];
+                    }
+                }
+            }
+        }
+        
+        [userApps sortUsingComparator:^NSComparisonResult(NSDictionary *obj1, NSDictionary *obj2) {
+            NSString *name1 = obj1[@"CFBundleDisplayName"] ?: obj1[@"CFBundleName"] ?: obj1[@"CFBundleIdentifier"];
+            NSString *name2 = obj2[@"CFBundleDisplayName"] ?: obj2[@"CFBundleName"] ?: obj2[@"CFBundleIdentifier"];
+            return [name1 localizedCaseInsensitiveCompare:name2];
+        }];
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            g_sharedLocalAppsCache = [userApps copy]; 
+            self.apps = g_sharedLocalAppsCache;
+            self.tableView.backgroundView = nil;
+            if (self.tableView.refreshControl.isRefreshing) {
+                [self.tableView.refreshControl endRefreshing];
+            }
+            [UIView transitionWithView:self.tableView duration:0.25 options:UIViewAnimationOptionTransitionCrossDissolve animations:^{
+                [self.tableView reloadData];
+            } completion:nil];
+        });
+    });
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    return [self isFiltering] ? self.filteredApps.count : self.apps.count;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"AppCell"];
+    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"AppCell"];
+    
+    NSDictionary *appInfo;
+    if ([self isFiltering]) {
+        appInfo = self.filteredApps[indexPath.row];
+    } else {
+        appInfo = self.apps[indexPath.row];
+    }
+    
+    NSString *name = appInfo[@"CFBundleDisplayName"] ?: appInfo[@"CFBundleName"] ?: appInfo[@"CFBundleIdentifier"];
+    cell.textLabel.text = name;
+    
+    NSString *bundlePath = appInfo[@"AppBundlePath"];
+    if (bundlePath) {
+        NSString *appGroupPath = [bundlePath stringByDeletingLastPathComponent];
+        NSString *placeholderPath = [appGroupPath stringByAppendingPathComponent:@"com.apple.mobileinstallation.placeholder"];
+        
+        BOOL isBlocked = (access(placeholderPath.UTF8String, F_OK) == 0) || [[NSFileManager defaultManager] fileExistsAtPath:placeholderPath];
+        NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+        
+        if ([self.waitingApps containsObject:bundleId]) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  (Waiting...)", bundleId];
+            cell.detailTextLabel.textColor = [UIColor systemOrangeColor];
+        } else if (isBlocked) {
+            cell.detailTextLabel.text = [NSString stringWithFormat:@"%@  (Blocked 🚫)", bundleId];
+            cell.detailTextLabel.textColor = [UIColor systemRedColor];
+        } else {
+            cell.detailTextLabel.text = bundleId;
+            cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+        }
+    } else {
+        cell.detailTextLabel.text = appInfo[@"CFBundleIdentifier"];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    }
+    
+    UIImage *iconImage = nil;
+    if (bundlePath) {
+        NSBundle *appBundle = [NSBundle bundleWithPath:bundlePath];
+        NSString *iconName = nil;
+        NSDictionary *icons = appInfo[@"CFBundleIcons"];
+        if ([icons isKindOfClass:[NSDictionary class]]) {
+            NSDictionary *primaryIcon = icons[@"CFBundlePrimaryIcon"];
+            if ([primaryIcon isKindOfClass:[NSDictionary class]]) {
+                NSArray *files = primaryIcon[@"CFBundleIconFiles"];
+                if ([files isKindOfClass:[NSArray class]]) {
+                    iconName = files.lastObject;
+                }
+            }
+        }
+        if (!iconName) {
+            NSArray *files = appInfo[@"CFBundleIconFiles"];
+            if ([files isKindOfClass:[NSArray class]]) {
+                iconName = files.lastObject;
+            }
+        }
+        if (iconName) {
+            UIImage *rawIcon = [UIImage imageNamed:iconName inBundle:appBundle compatibleWithTraitCollection:nil];
+            if (rawIcon) {
+                CGSize itemSize = CGSizeMake(40, 40);
+                UIGraphicsBeginImageContextWithOptions(itemSize, NO, [UIScreen mainScreen].scale);
+                UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, itemSize.width, itemSize.height) cornerRadius:8.0];
+                [path addClip];
+                [rawIcon drawInRect:CGRectMake(0, 0, itemSize.width, itemSize.height)];
+                iconImage = UIGraphicsGetImageFromCurrentImageContext();
+                UIGraphicsEndImageContext();
+            }
+        }
+    }
+    
+    if (iconImage) {
+        cell.imageView.image = iconImage;
+    } else {
+        UIImage *fallback = [UIImage systemImageNamed:@"app.dashed"];
+        cell.imageView.image = [fallback imageWithTintColor:[UIColor systemGrayColor] renderingMode:UIImageRenderingModeAlwaysOriginal];
+    }
+    
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    
+    NSDictionary *appInfo = [self isFiltering] ? self.filteredApps[indexPath.row] : self.apps[indexPath.row];
+    NSString *bundleId = appInfo[@"CFBundleIdentifier"];
+    if (!bundleId) return;
+    
+    if ([self.waitingApps containsObject:bundleId]) {
+        [self.waitingApps removeObject:bundleId];
+    } else {
+        [self.waitingApps addObject:bundleId];
+    }
+    
+    UIImpactFeedbackGenerator *feedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [feedback impactOccurred];
+    [tableView reloadRowsAtIndexPaths:@[indexPath] withRowAnimation:UITableViewRowAnimationFade];
+}
+
+- (void)commitUpdates {
+    if (self.waitingApps.count == 0) return;
+    
+    InstallProgressViewController *logVC = [[InstallProgressViewController alloc] init];
+    UINavigationController *logNav = [[UINavigationController alloc] initWithRootViewController:logVC];
+    logNav.modalPresentationStyle = UIModalPresentationAutomatic;
+    
+    [self presentViewController:logNav animated:YES completion:^{
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            log_session_begin();
+            log_user("[BLOCK] Preparing to process %lu app(s).\n", (unsigned long)self.waitingApps.count);
+            
+            if (!settings_ensure_kexploit()) {
+                log_user("[FAIL] Kernel primitives not acquired. Please retry.\n");
+                log_session_end();
+                return;
+            }
+            
+            settings_request_all_live_loops_stop("installd process switch");
+            settings_wait_live_loops_stopped_for_switch("installd process switch");
+            
+            @synchronized (settings_rc_lock()) {
+                if (g_springboard_rc_ready) {
+                    settings_destroy_springboard_remote_call_locked_internal("switching to installd", NO);
+                }
+                
+                log_user("\n==================================================\n");
+                log_user("[ACTION REQUIRED] The 'installd' daemon is asleep.\n");
+                log_user("Please switch to the App Store and start downloading ANY app to wake it up.\n");
+                log_user("Keep this app in the background. Once the download starts, return here.\n");
+                log_user("Waiting for installd process to appear...\n");
+                log_user("==================================================\n\n");
+                
+                int retryCount = 0;
+                while (init_remote_call("installd", false) != 0) {
+                    sleep(2); 
+                    retryCount++;
+                    if (retryCount % 5 == 0) {
+                        log_user("[WAIT] Still waiting... Go to App Store and tap 'Get' or 'Download' on any app.\n");
+                    }
+                    if (retryCount > 60) {
+                        log_user("[FAIL] Timeout waiting for installd to wake up.\n");
+                        log_session_end();
+                        return;
+                    }
+                }
+                
+                log_user("[OK] 'installd' has been successfully hooked!\n");
+                log_user("[BLOCK] Applying placeholders...\n");
+                
+                for (NSString *bundleId in self.waitingApps) {
+                    NSDictionary *targetAppInfo = nil;
+                    for (NSDictionary *info in self.apps) {
+                        if ([info[@"CFBundleIdentifier"] isEqualToString:bundleId]) {
+                            targetAppInfo = info;
+                            break;
+                        }
+                    }
+                    
+                    if (!targetAppInfo) continue;
+                    NSString *appName = targetAppInfo[@"CFBundleDisplayName"] ?: targetAppInfo[@"CFBundleName"] ?: bundleId;
+                    NSString *bundlePath = targetAppInfo[@"AppBundlePath"];
+                    NSString *appGroupPath = [bundlePath stringByDeletingLastPathComponent];
+                    NSString *placeholderPath = [appGroupPath stringByAppendingPathComponent:@"com.apple.mobileinstallation.placeholder"];
+                    
+                    BOOL isAlreadyBlocked = (access(placeholderPath.UTF8String, F_OK) == 0);
+                    
+                    uint64_t pathPtr = downgrade_remote_alloc_str(placeholderPath.UTF8String);
+                    if (pathPtr) {
+                        if (isAlreadyBlocked) {
+                            do_remote_call_stable(1000, "chmod", pathPtr, 0755, 0, 0, 0, 0, 0, 0);
+                            uint64_t ret = do_remote_call_stable(1000, "rmdir", pathPtr, 0, 0, 0, 0, 0, 0, 0);
+                            if (ret == 0) log_user("[OK] Unblocked updates for: %s\n", appName.UTF8String);
+                            else log_user("[WARN] Failed to unblock %s (Code: %llu)\n", appName.UTF8String, ret);
+                        } else {
+                            uint64_t ret = do_remote_call_stable(1000, "mkdir", pathPtr, 0755, 0, 0, 0, 0, 0, 0);
+                            do_remote_call_stable(1000, "chmod", pathPtr, 0000, 0, 0, 0, 0, 0, 0);
+                            if (ret == 0) log_user("[OK] Blocked updates for: %s\n", appName.UTF8String);
+                            else log_user("[WARN] Failed to block %s (Code: %llu)\n", appName.UTF8String, ret);
+                        }
+                        do_remote_call_stable(1000, "free", pathPtr, 0, 0, 0, 0, 0, 0, 0);
+                    }
+                }
+                destroy_remote_call();
+            }
+            
+            log_user("[DONE] Operation completed successfully.\n");
+            log_session_end();
+            
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [self.waitingApps removeAllObjects];
+                [self.tableView reloadData];
+                [[NSNotificationCenter defaultCenter] postNotificationName:kSettingsActionsDidCompleteNotification object:nil];
+            });
+        });
+    }];
+}
+@end
+// 👆================ 降级与屏蔽功能核心代码 ================👆
 
 @interface SettingsViewController () <UIDocumentPickerDelegate, PHPickerViewControllerDelegate>
 @property (nonatomic, strong) UISegmentedControl *powercuffSegmented;
@@ -7593,6 +8651,8 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
         case SectionIPADecryptor: return self.ipaDecryptorRows;
         case SectionSnowBoardLite: return self.snowboardLiteRows;
         case SectionLiveWP: return self.liveWPRows;
+case SectionAppDowngrade: return @[];
+        case SectionBlockUpdates: return @[];
         default: return @[];
     }
 }
@@ -7630,6 +8690,8 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
         @{ @"title": @"SpringBoard Tweaks", @"icon": @"apps.iphone",                         @"color": [UIColor systemIndigoColor], @"section": @(SectionDarkSwordTweaks) },
         @{ @"title": @"Drag Coefficient",   @"icon": @"dial.medium.fill",                    @"color": [UIColor systemIndigoColor], @"section": @(SectionDragCoefficient) },
         @{ @"title": @"Home Layout Extras", @"icon": @"square.dashed.inset.filled",          @"color": [UIColor systemPurpleColor], @"section": @(SectionLayoutExtras) },
+@{ @"title": @"App Downgrade",      @"icon": @"arrow.down.app.fill",                @"color": [UIColor systemPurpleColor], @"section": @(SectionAppDowngrade) },
+        @{ @"title": @"Block Updates",      @"icon": @"lock.shield.fill",                   @"color": [UIColor systemRedColor],    @"section": @(SectionBlockUpdates) },
     ];
 }
 
@@ -7649,9 +8711,9 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
         if ([bundle[@"indev"] boolValue]) continue;
         if ([bundle[@"experimental"] boolValue] && !experimentalOn) continue;
         NSInteger sec = [bundle[@"section"] integerValue];
-        if ([self rowsForSection:sec].count > 0) {
-            [out addObject:bundle];
-        }
+        if ([self rowsForSection:sec].count > 0 || sec == SectionAppDowngrade || sec == SectionBlockUpdates) {
+                [out addObject:bundle];
+            }
     }
     return out;
 }
@@ -11345,8 +12407,49 @@ void cyanide_present_contact(UIViewController *host)
                 NSDictionary *bundle = bundles[indexPath.row];
                 NSInteger underlying = [bundle[@"section"] integerValue];
                 NSString *pushTitle = bundle[@"title"];
+                
+                // 👇========= 追加跳转拦截逻辑 =========👇
+                if (underlying == SectionAppDowngrade || underlying == SectionBlockUpdates) {
+                    if (!g_kexploit_done) {
+                        UIAlertController *loadingAlert = [UIAlertController alertControllerWithTitle:@"Initializing" 
+                                                                                              message:@"Acquiring kernel primitives...\n" 
+                                                                                       preferredStyle:UIAlertControllerStyleAlert];
+                        __weak typeof(self) weakSelf = self;
+                        [self presentViewController:loadingAlert animated:YES completion:^{
+                            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                                log_session_begin();
+                                BOOL ok = settings_ensure_kexploit();
+                                log_session_end();
+                                
+                                dispatch_async(dispatch_get_main_queue(), ^{
+                                    __strong typeof(weakSelf) strongSelf = weakSelf;
+                                    if (!strongSelf) return;
+                                    
+                                    [loadingAlert dismissViewControllerAnimated:YES completion:^{
+                                        if (ok) {
+                                            UIViewController *targetVC = (underlying == SectionAppDowngrade) ? [[AppListViewController alloc] init] : [[BlockUpdatesViewController alloc] init];
+                                            [strongSelf.navigationController pushViewController:targetVC animated:YES];
+                                        } else {
+                                            UIAlertController *errAlert = [UIAlertController alertControllerWithTitle:@"Failed" 
+                                                                                                              message:@"Could not acquire kernel primitives. Please try again or reboot." 
+                                                                                                       preferredStyle:UIAlertControllerStyleAlert];
+                                            [errAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                                            [strongSelf presentViewController:errAlert animated:YES completion:nil];
+                                        }
+                                    }];
+                                });
+                            });
+                        }];
+                    } else {
+                        UIViewController *targetVC = (underlying == SectionAppDowngrade) ? [[AppListViewController alloc] init] : [[BlockUpdatesViewController alloc] init];
+                        [self.navigationController pushViewController:targetVC animated:YES];
+                    }
+                    return;
+                }
+                // 👆========= 拦截逻辑结束 =========👆
+
                 SettingsViewController *detail = [[SettingsViewController alloc] initWithUnderlyingSection:underlying
-                                                                                              bundleTitle:pushTitle];
+                                                                                               bundleTitle:pushTitle];
                 [self.navigationController pushViewController:detail animated:YES];
                 return;
             }
