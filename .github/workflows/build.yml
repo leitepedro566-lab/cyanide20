@@ -1,0 +1,59 @@
+name: Build Cyanide IPA (Manual)
+
+on:
+
+  workflow_dispatch: 
+
+jobs:
+  build:
+    name: Build and Package
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive 
+          fetch-depth: 0
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install Dependencies
+        run: |
+          
+          brew install ldid xcbeautify
+
+      - name: Build libxpf.dylib (XPF Framework)
+        run: |
+          
+          echo "==> Building XPF Framework..."
+          cd Cyanide/XPF
+          make
+          
+          
+          ls -la output/ios/libxpf.dylib
+          echo "==> XPF Framework built successfully."
+
+      - name: Make Scripts Executable
+        run: |
+          chmod +x scripts/build.sh
+          chmod +x scripts/release.sh
+
+      - name: Build Project and Package IPA
+        env:
+          CONFIG: Release
+          SDK: iphoneos
+        run: |
+          
+          ./scripts/build.sh
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cyanide-Release
+          path: build/*.ipa
+          if-no-files-found: error
+          retention-days: 7
